@@ -1,28 +1,78 @@
-name: Build mod
-on:
-  push:
-  workflow_dispatch:
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 21
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.10.2"
-      - name: Build
-        run: |
-          DIR=$(dirname "$(find . -name build.gradle -not -path './.git/*' | head -1)")
-          echo "Projet trouvé dans $DIR"
-          cd "$DIR"
-          gradle build --no-daemon
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          cp build/libs/*.jar "$GITHUB_WORKSPACE/out/"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: freehost-mod
-          path: out/*.jar
+package com.freehost.client;
+
+import com.freehost.client.networking.GuestProxy;
+import com.freehost.client.screens.MainMenuScreen;
+import com.freehost.common.config.FreeHostConfig;
+import com.freehost.server.hosting.HostManager;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.fabricmc.fabric.api.client.screen.v1.Screens;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.ClickableWidget;
+import net.minecraft.text.TranslatableTextContent;
+import java.util.ArrayList;
+import net.minecraft.text.Text;
+
+public class FreeHostClient implements ClientModInitializer {
+    @Override
+    public void onInitializeClient() {
+        FreeHostConfig.load();
+
+        // Menu principal : "World Hosting" remplace le bouton Multijoueur. Menu pause : bouton en haut à gauche.
+        ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+            if (screen instanceof TitleScreen) {
+                ClickableWidget multiplayer = null;
+                for (ClickableWidget b : new ArrayList<>(Screens.getButtons(screen))) {
+                    if (b.getMessage().getContent() instanceof TranslatableTextContent t
+                            && t.getKey().equals("menu.multiplayer")) {
+                        multiplayer = b;
+                        break;
+                    }
+                }
+                if (multiplayer != null) {
+                    ButtonWidget replacement = ButtonWidget.builder(Text.literal("World Hosting"),
+                                    b -> client.setScreen(new MainMenuScreen(screen)))
+                            .dimensions(multiplayer.getX(), multiplayer.getY(), multiplayer.getWidth(), multiplayer.getHeight())
+                            .build();
+                    Screens.getButtons(screen).remove(multiplayer);
+                    Screens.getButtons(screen).add(replacement);
+                } else {
+                    Screens.getButtons(screen).add(
+                            ButtonWidget.builder(Text.literal("World Hosting"), b -> client.setScreen(new MainMenuScreen(screen)))
+                                    .dimensions(4, 4, 100, 20).build());
+                }
+            } else if (screen instanceof GameMenuScreen) {
+                Screens.getButtons(screen).add(
+                        ButtonWidget.builder(Text.literal("World Hosting"), b -> client.setScreen(new MainMenuScreen(screen)))
+                                .dimensions(4, 4, 100, 20).build());
+            }
+        });
+
+        // Monde lancé depuis "Host World" : on démarre l'hébergement dès qu'on est dedans
+        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+            if (HostManager.consumePending()) HostManager.start(client);
+        });
+
+        // Fermeture du monde / déconnexion : arrêt propre
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            HostManager.stop(false);
+            GuestProxy.stop();
+        });
+
+        // Limite de joueurs (le serveur solo en autorise 8 par défaut, on applique la config)
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            if (HostManager.state() == HostManager.State.ONLINE
+                    && server.getCurrentPlayerCount() > FreeHostConfig.maxPlayers) {
+                handler.disconnect(Text.literal("The world is full"));
+            }
+        });
+
+        ClientLifecycleEvents.CLIENT_STOPPING.register(c -> HostManager.shutdown());
+        Runtime.getRuntime().addShutdownHook(new Thread(HostManager::shutdown));
+    }
+}
